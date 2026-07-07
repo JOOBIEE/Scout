@@ -1,0 +1,112 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Search {
+  id           String         @id @default(cuid())
+  businessType String
+  location     String
+  status       String         @default("pending") // pending, collecting, analyzing, done, failed
+  createdAt    DateTime       @default(now())
+  results      SearchResult[]
+}
+
+model Business {
+  id                String   @id @default(cuid())
+  name              String
+  address           String?
+  phone             String?
+  websiteUrl        String?
+  websiteSource     String?  // "foursquare" | "guessed"
+  websiteConfidence Int?     // 0-100, only set when websiteSource = "guessed"
+  rating            Float?
+  reviewCount       Int?
+  externalPlaceId   String   @unique
+  createdAt         DateTime @default(now())
+
+  audit            WebsiteAudit?
+  opportunities    Opportunity[]
+  outreachMessages OutreachMessage[]
+  crmStatus        CrmStatus?
+  priorityScore    PriorityScore?
+  searchResults    SearchResult[]
+}
+
+model SearchResult {
+  id         String   @id @default(cuid())
+  search     Search   @relation(fields: [searchId], references: [id])
+  searchId   String
+  business   Business @relation(fields: [businessId], references: [id])
+  businessId String
+  isNew      Boolean  // was this business first discovered in THIS search?
+  createdAt  DateTime @default(now())
+
+  @@unique([searchId, businessId])
+}
+
+model WebsiteAudit {
+  id                 String    @id @default(cuid())
+  business           Business  @relation(fields: [businessId], references: [id])
+  businessId         String    @unique
+  status             String    @default("pending") // pending, running, done, failed, no_website
+  title              String?
+  metaDescription    String?
+  techStack          String?   // JSON string
+  hasSsl             Boolean?
+  isMobileFriendly   Boolean?
+  loadTimeMs         Int?
+  seoScore           Int?
+  brandingScore      Int?
+  trustScore         Int?
+  mobileScore        Int?
+  accessibilityScore Int?
+  overallScore       Int?
+  rawFindings        String?   // JSON string
+  auditedAt          DateTime?
+  screenshotDesktopPath String?
+  screenshotMobilePath  String?
+}
+
+model Opportunity {
+  id         String   @id @default(cuid())
+  business   Business @relation(fields: [businessId], references: [id])
+  businessId String
+  text       String
+  category   String   // seo, trust, performance, conversion
+  severity   String   // low, medium, high
+  createdAt  DateTime @default(now())
+}
+
+model OutreachMessage {
+  id           String   @id @default(cuid())
+  business     Business @relation(fields: [businessId], references: [id])
+  businessId   String
+  channel      String   // email, dm, whatsapp
+  subject      String?
+  body         String
+  generatedAt  DateTime @default(now())
+  editedByUser Boolean  @default(false)
+}
+
+model CrmStatus {
+  id         String   @id @default(cuid())
+  business   Business @relation(fields: [businessId], references: [id])
+  businessId String   @unique
+  status     String   @default("not_contacted")
+  notes      String?
+  updatedAt  DateTime @updatedAt
+}
+
+model PriorityScore {
+  id         String   @id @default(cuid())
+  business   Business @relation(fields: [businessId], references: [id])
+  businessId String   @unique
+  score      Int
+  reasoning  String?  // JSON string
+  computedAt DateTime @default(now())
+}

@@ -3,15 +3,12 @@ FROM mcr.microsoft.com/playwright:v1.61.1-jammy
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci --omit=dev
-
 COPY prisma ./prisma
-RUN npx prisma generate
+
+RUN npm ci --omit=dev
 
 COPY . .
 
 EXPOSE 4000
-
-CMD ["node", "src/server.js"]
 
 CMD ["sh", "-c", "npx prisma migrate deploy && node src/server.js"]

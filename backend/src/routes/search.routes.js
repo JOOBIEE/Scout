@@ -8,27 +8,22 @@ import { computeRawScore, assignTiers } from '../services/priority/priorityEngin
 
 const router = express.Router();
 
-const GUESS_CONCURRENCY = 5;
+const GUESS_CONCURRENCY = Number(process.env.GUESS_CONCURRENCY) || 2;
 
-router.post('/', async (req, res) => {
-  const { businessType, location } = req.body;
-
-  if (!businessType || !location) {
-    return res.status(400).json({ error: 'businessType and location are required' });
-  }
-
-  let search;
+// The actual pipeline - runs in the background, NOT awaited by the request handler.
+async function runPipeline(searchId, businessType, location) {
   const limit = pLimit(GUESS_CONCURRENCY);
 
   try {
-    search = await prisma.search.create({
-      data: { businessType, location, status: 'collecting' },
-    });
-
-    // --- Step 1: fetch raw places from Foursquare ---
+    // --- Step 1: fetch raw places ---
     const places = await searchBusinesses(businessType, location);
 
-    // --- Step 2: upsert each business, track which are genuinely new, attach to this search ---
+    await prisma.search.update({
+      where: { id: searchId },
+      data: { status: 'collecting', totalBusinesses: places.length },
+    });
+
+    // --- Step 2: upsert businesses, attach to this search ---
     const businesses = await Promise.all(
       places.map(async (place) => {
         const existing = await prisma.business.findUnique({
@@ -52,27 +47,18 @@ router.post('/', async (req, res) => {
         });
 
         await prisma.searchResult.upsert({
-          where: {
-            searchId_businessId: { searchId: search.id, businessId: business.id },
-          },
+          where: { searchId_businessId: { searchId, businessId: business.id } },
           update: {},
-          create: {
-            searchId: search.id,
-            businessId: business.id,
-            isNew: !existing,
-          },
+          create: { searchId, businessId: business.id, isNew: !existing },
         });
 
         return { ...business, isNew: !existing };
       })
     );
 
-    await prisma.search.update({
-      where: { id: search.id },
-      data: { status: 'analyzing' },
-    });
+    // --- Step 3: guess websites for new businesses without one ---
+    await prisma.search.update({ where: { id: searchId }, data: { status: 'guessing' } });
 
-    // --- Step 3: guess a website for new businesses that don't have one yet ---
     await Promise.all(
       businesses
         .filter((b) => b.isNew && !b.websiteUrl)
@@ -82,23 +68,18 @@ router.post('/', async (req, res) => {
             if (best) {
               await prisma.business.update({
                 where: { id: b.id },
-                data: {
-                  websiteUrl: best.url,
-                  websiteSource: 'guessed',
-                  websiteConfidence: best.confidence,
-                },
+                data: { websiteUrl: best.url, websiteSource: 'guessed', websiteConfidence: best.confidence },
               });
             }
           })
         )
     );
 
-    // --- Step 4: verify EVERY unverified website URL, regardless of source ---
+    // --- Step 4: verify every unverified URL ---
+    await prisma.search.update({ where: { id: searchId }, data: { status: 'verifying' } });
+
     const unverifiedBusinesses = await prisma.business.findMany({
-      where: {
-        websiteUrl: { not: null },
-        websiteConfidence: null,
-      },
+      where: { websiteUrl: { not: null }, websiteConfidence: null },
     });
 
     await Promise.all(
@@ -106,26 +87,24 @@ router.post('/', async (req, res) => {
         limit(async () => {
           const result = await verifyWebsiteMatch(b.websiteUrl, b.name, location, b.phone);
           const confidence = Math.round(Math.min((result.score / 70) * 100, 100));
-          await prisma.business.update({
-            where: { id: b.id },
-            data: { websiteConfidence: confidence },
-          });
+          await prisma.business.update({ where: { id: b.id }, data: { websiteConfidence: confidence } });
         })
       )
     );
 
-    // --- Step 5: audit every business's website (skip already-audited, skip low-confidence guessed matches) ---
+    // --- Step 5: audit every business (skip already-audited / low-confidence guesses) ---
+    await prisma.search.update({ where: { id: searchId }, data: { status: 'auditing' } });
+
     const needsAudit = await prisma.business.findMany({
       where: {
         id: { in: businesses.map((b) => b.id) },
         audit: null,
         websiteUrl: { not: null },
-        OR: [
-          { websiteConfidence: null },
-          { websiteConfidence: { gte: 50 } },
-        ],
+        OR: [{ websiteConfidence: null }, { websiteConfidence: { gte: 50 } }],
       },
     });
+
+    let auditedSoFar = 0;
 
     await Promise.all(
       needsAudit.map((b) =>
@@ -133,63 +112,55 @@ router.post('/', async (req, res) => {
           const result = await runAudit(b.websiteUrl, b.id);
 
           if (result.status === 'no_website') {
+            await prisma.websiteAudit.create({ data: { businessId: b.id, status: 'no_website' } });
+          } else if (result.status === 'failed') {
             await prisma.websiteAudit.create({
-              data: { businessId: b.id, status: 'no_website' },
+              data: { businessId: b.id, status: 'failed', rawFindings: JSON.stringify({ error: result.error }) },
             });
-            return;
-          }
-
-          if (result.status === 'failed') {
+          } else {
             await prisma.websiteAudit.create({
               data: {
                 businessId: b.id,
-                status: 'failed',
-                rawFindings: JSON.stringify({ error: result.error }),
+                status: 'done',
+                title: result.title,
+                metaDescription: result.metaDescription,
+                techStack: result.techStack,
+                hasSsl: result.hasSsl,
+                loadTimeMs: result.loadTimeMs,
+                seoScore: result.seoScore,
+                trustScore: result.trustScore,
+                brandingScore: result.brandingScore,
+                overallScore: result.overallScore,
+                rawFindings: result.rawFindings,
+                screenshotDesktopPath: result.screenshotDesktopPath,
+                screenshotMobilePath: result.screenshotMobilePath,
+                auditedAt: new Date(),
               },
             });
-            return;
+
+            if (result.opportunities?.length) {
+              await prisma.opportunity.createMany({
+                data: result.opportunities.map((o) => ({
+                  businessId: b.id,
+                  text: o.text,
+                  category: o.category,
+                  severity: o.severity,
+                })),
+              });
+            }
           }
 
-          await prisma.websiteAudit.create({
-            data: {
-            businessId: b.id,
-            status: 'done',
-            title: result.title,
-            metaDescription: result.metaDescription,
-            techStack: result.techStack,
-            hasSsl: result.hasSsl,
-            loadTimeMs: result.loadTimeMs,
-            seoScore: result.seoScore,
-            trustScore: result.trustScore,
-            brandingScore: result.brandingScore,
-            overallScore: result.overallScore,
-            rawFindings: result.rawFindings,
-            screenshotDesktopPath: result.screenshotDesktopPath,
-            screenshotMobilePath: result.screenshotMobilePath,
-            auditedAt: new Date(),
-            },
-          });
-
-          if (result.opportunities?.length) {
-            await prisma.opportunity.createMany({
-              data: result.opportunities.map((o) => ({
-                businessId: b.id,
-                text: o.text,
-                category: o.category,
-                severity: o.severity,
-              })),
-            });
-          }
+          auditedSoFar += 1;
+          await prisma.search.update({ where: { id: searchId }, data: { auditedCount: auditedSoFar } });
         })
       )
     );
 
-// --- Step 6: compute priority - always recompute, ranked across THIS search's businesses ---
+    // --- Step 6: recompute priority for everyone in this search ---
+    await prisma.search.update({ where: { id: searchId }, data: { status: 'prioritizing' } });
+
     const forPriority = await prisma.business.findMany({
-      where: {
-        id: { in: businesses.map((b) => b.id) },
-        audit: { isNot: null },
-      },
+      where: { id: { in: businesses.map((b) => b.id) }, audit: { isNot: null } },
       include: { audit: true, opportunities: true },
     });
 
@@ -205,51 +176,61 @@ router.post('/', async (req, res) => {
     for (const entry of tiered) {
       await prisma.priorityScore.upsert({
         where: { businessId: entry.businessId },
-        update: {
-          score: entry.score,
-          reasoning: JSON.stringify({ tier: entry.tier, reasons: entry.reasoning }),
-          computedAt: new Date(),
-        },
-        create: {
-          businessId: entry.businessId,
-          score: entry.score,
-          reasoning: JSON.stringify({ tier: entry.tier, reasons: entry.reasoning }),
-        },
+        update: { score: entry.score, reasoning: JSON.stringify({ tier: entry.tier, reasons: entry.reasoning }), computedAt: new Date() },
+        create: { businessId: entry.businessId, score: entry.score, reasoning: JSON.stringify({ tier: entry.tier, reasons: entry.reasoning }) },
       });
     }
 
-    // --- Step 7: mark search complete, return full result set ---
-    await prisma.search.update({
-      where: { id: search.id },
-      data: { status: 'done' },
+    await prisma.search.update({ where: { id: searchId }, data: { status: 'done' } });
+  } catch (err) {
+    console.error(`Pipeline failed for search ${searchId}:`, err);
+    await prisma.search
+      .update({ where: { id: searchId }, data: { status: 'failed', errorMessage: err.message } })
+      .catch(() => {});
+  }
+}
+
+// Kicks off a search and returns immediately - does NOT wait for the pipeline.
+router.post('/', async (req, res) => {
+  const { businessType, location } = req.body;
+
+  if (!businessType || !location) {
+    return res.status(400).json({ error: 'businessType and location are required' });
+  }
+
+  try {
+    const search = await prisma.search.create({
+      data: { businessType, location, status: 'pending' },
     });
 
-    const results = await prisma.searchResult.findMany({
-      where: { searchId: search.id },
-     include: {
-  business: {
-    include: { audit: true, opportunities: true, priorityScore: true, crmStatus: true },
-  },
-},
-      orderBy: { createdAt: 'asc' },
-    });
+    // Fire and forget - intentionally not awaited.
+    runPipeline(search.id, businessType, location);
 
-    res.json({
-      search: { ...search, status: 'done' },
-      businesses: results.map((r) => ({ ...r.business, isNew: r.isNew })),
-    });
+    res.status(202).json({ searchId: search.id });
   } catch (err) {
     console.error(err);
-    if (search) {
-      await prisma.search
-        .update({ where: { id: search.id }, data: { status: 'failed' } })
-        .catch(() => {});
-    }
     res.status(500).json({ error: err.message });
   }
 });
 
-// Fetch results for a previously-run search
+// Lightweight polling endpoint - just status/progress, no business data.
+router.get('/:id/status', async (req, res) => {
+  try {
+    const search = await prisma.search.findUnique({ where: { id: req.params.id } });
+    if (!search) return res.status(404).json({ error: 'Search not found' });
+    res.json({
+      status: search.status,
+      totalBusinesses: search.totalBusinesses,
+      auditedCount: search.auditedCount,
+      errorMessage: search.errorMessage,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Full results, fetched once the search is done (or to revisit a past search).
 router.get('/:id', async (req, res) => {
   try {
     const search = await prisma.search.findUnique({ where: { id: req.params.id } });
@@ -257,18 +238,11 @@ router.get('/:id', async (req, res) => {
 
     const results = await prisma.searchResult.findMany({
       where: { searchId: search.id },
-     include: {
-  business: {
-    include: { audit: true, opportunities: true, priorityScore: true, crmStatus: true },
-  },
-},
+      include: { business: { include: { audit: true, opportunities: true, priorityScore: true, crmStatus: true } } },
       orderBy: { createdAt: 'asc' },
     });
 
-    res.json({
-      search,
-      businesses: results.map((r) => ({ ...r.business, isNew: r.isNew })),
-    });
+    res.json({ search, businesses: results.map((r) => ({ ...r.business, isNew: r.isNew })) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });

@@ -8,12 +8,15 @@ datasource db {
 }
 
 model Search {
-  id           String         @id @default(cuid())
-  businessType String
-  location     String
-  status       String         @default("pending") // pending, collecting, analyzing, done, failed
-  createdAt    DateTime       @default(now())
-  results      SearchResult[]
+  id             String         @id @default(cuid())
+  businessType   String
+  location       String
+  status         String         @default("pending") // pending, collecting, guessing, verifying, auditing, prioritizing, done, failed
+  totalBusinesses Int           @default(0)
+  auditedCount   Int            @default(0)
+  errorMessage   String?
+  createdAt      DateTime       @default(now())
+  results        SearchResult[]
 }
 
 model Business {

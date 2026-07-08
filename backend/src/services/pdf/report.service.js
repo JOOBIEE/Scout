@@ -3,7 +3,7 @@ import path from 'path';
 import { getBrowser } from '../browserManager.service.js';
 import { buildReportHtml } from './reportTemplate.js';
 
-const REPORT_DIR = path.join(process.cwd(), 'public', 'reports');
+const REPORT_DIR = process.env.REPORT_DIR || path.join(process.cwd(), 'public', 'reports');
 
 if (!fs.existsSync(REPORT_DIR)) {
   fs.mkdirSync(REPORT_DIR, { recursive: true });

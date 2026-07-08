@@ -44,6 +44,12 @@ async function shutdown() {
   process.exit(0);
 }
 
+const allowedOrigins = process.env.FRONTEND_URL
+  ? [process.env.FRONTEND_URL, 'http://localhost:5173']
+  : ['http://localhost:5173'];
+
+app.use(cors({ origin: allowedOrigins }));
+
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.on('SIGUSR2', shutdown);

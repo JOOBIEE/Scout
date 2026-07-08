@@ -5,7 +5,7 @@ import { getBrowser } from './browserManager.service.js';
 
 const TIMEOUT_MS = 7000;
 const CONCURRENCY = 8;
-const PLAYWRIGHT_CONCURRENCY = 3; // browsers are heavy, keep this low
+const PLAYWRIGHT_CONCURRENCY = Number(process.env.PLAYWRIGHT_CONCURRENCY) || 1;
 const USER_AGENT = 'ScoutBot/1.0 (+business website checker)';
 
 const CORPORATE_SUFFIXES = [

@@ -3,9 +3,9 @@ import path from 'path';
 import pLimit from 'p-limit';
 import { getBrowser } from '../browserManager.service.js';
 
-const SCREENSHOT_DIR = path.join(process.cwd(), 'public', 'screenshots');
+const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR || path.join(process.cwd(), 'public', 'screenshots');
 const TIMEOUT_MS = 15000;
-const limit = pLimit(3); // screenshots are expensive - cap total concurrent captures
+const limit = pLimit(Number(process.env.SCREENSHOT_CONCURRENCY) || 1);
 
 if (!fs.existsSync(SCREENSHOT_DIR)) {
   fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
